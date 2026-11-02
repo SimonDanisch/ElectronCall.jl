@@ -9,6 +9,12 @@ const BrowserWindow = electron.BrowserWindow;
 const app = electron.app;
 const ipcMain = electron.ipcMain;
 
+// Bonito's `evaljs` needs `'unsafe-eval'`, so any CSP that lets Bonito run would
+// still trigger Electron's "Insecure Content-Security-Policy" dev warning. The
+// warning is development-only (it never shows in a packaged app) and ElectronCall
+// only ever loads trusted local content, so we disable the dev-only warning here.
+process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
+
 let sysnotify_connection = null;
 let security_config = null;
 
@@ -93,27 +99,44 @@ function createWindow(connection, opts) {
 
     const win_id = win.id;
 
-    // Set up secure communication based on security config
-    if (!security_config || !security_config.context_isolation) {
-        // Legacy mode - inject sendMessageToJulia directly
+    // Set up communication with the renderer.
+    //
+    // The secure path is the preload script (`preload.js`), which exposes
+    // `sendMessageToJulia` via `contextBridge`. Whenever a preload is active we
+    // must NOT also inject a `require('electron')` snippet into the page: under
+    // context isolation / sandboxing `require` does not exist in the page's main
+    // world, so that injection throws `ReferenceError: require is not defined`
+    // (and `global` is undefined there too). Note that when `security_config` is
+    // null we STILL build a secure window above (contextIsolation=true,
+    // nodeIntegration=false, default preload) — so keying the legacy injection on
+    // `!security_config` was wrong and produced exactly that error.
+    //
+    // Only fall back to direct injection when there is genuinely no preload and
+    // Node integration is enabled with context isolation off — the one config in
+    // which page scripts can use `require`.
+    const effectivePrefs = opts.webPreferences || {};
+    const hasPreload = Boolean(effectivePrefs.preload);
+    const canUseRequireInPage =
+        effectivePrefs.nodeIntegration === true && effectivePrefs.contextIsolation === false;
+    if (!hasPreload && canUseRequireInPage) {
+        // Legacy mode - inject sendMessageToJulia directly (nodeIntegration only)
         win.webContents.on("did-finish-load", function() {
             if (!win.isDestroyed()) {
                 win.webContents.executeJavaScript(`
                     try {
-                        const {ipcRenderer} = require('electron');
-                        function sendMessageToJulia(message) {
-                            ipcRenderer.send('msg-for-julia-process', message);
-                        };
-                        global['sendMessageToJulia'] = sendMessageToJulia;
+                        if (typeof require !== 'undefined') {
+                            const {ipcRenderer} = require('electron');
+                            window.sendMessageToJulia = function(message) {
+                                ipcRenderer.send('msg-for-julia-process', message);
+                            };
+                        }
                     } catch(e) { console.warn('ElectronCall: Failed to set up sendMessageToJulia', e); }
                     undefined
                 `).catch(() => {});
             }
         });
-    } else {
-        // Secure mode - communication via preload script
-        // The preload script handles the secure bridge
     }
+    // Secure mode (preload active): the preload script handles the bridge.
 
     // `connection` is a STRICT request/response stream: Julia writes one command
     // and reads exactly one line back (req_response_js, under comm_lock). So the
